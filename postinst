@@ -1,0 +1,47 @@
+#!/bin/sh
+set -eu
+
+alternatives=
+java_home=<%= java_home %>
+priority=<%= priority %>
+mandir=$java_home/man
+binaries=$(find $java_home/bin \
+  -regextype posix-extended \
+  -regex "<%= bin_ignore %>" -prune -o \
+  -type f \
+  -printf "%f\n")
+
+case "$1" in
+configure)
+  from="$2"
+
+  if [ -z "$from" ]; then
+    # New install - configure alternatives
+    alternatives=y
+  else
+    # Upgrade - configure alternatives if not done already
+    for b in $binaries; do
+      if ! update-alternatives --list $b 2>/dev/null | grep -q ^$java_home/; then
+        alternatives=y
+        break
+      fi
+    done
+  fi
+
+  if [ "$alternatives" = y ]; then
+    for b in $binaries; do
+      if [ -e $mandir/man1/$b.1 ]; then
+        slave="--slave /usr/share/man/man1/${b}.1 ${b}.1 ${mandir}/man1/${b}.1"
+      else
+        slave=
+      fi
+      update-alternatives \
+        --install \
+        "/usr/bin/${b}" \
+        "$b" \
+        "${java_home}/bin/${b}" \
+        $priority \
+        $slave
+    done
+  fi;;
+esac

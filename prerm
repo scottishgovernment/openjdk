@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+java_home=<%= java_home %>
+binaries=$(find $java_home/bin \
+  -regextype posix-extended \
+  -regex "<%= bin_ignore %>" -prune -o \
+  -type f \
+  -printf "%f\n")
+
+case "$1" in
+remove)
+  for b in $binaries; do
+    update-alternatives \
+      --remove \
+      "$b" \
+      "${java_home}/bin/${b}"
+  done;;
+esac

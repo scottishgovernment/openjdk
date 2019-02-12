@@ -1,0 +1,196 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(dirname "$0")
+
+# Globals:
+# Directory for storing and unpacking downloads
+work_dir=${WORK_DIR:-$PWD}
+
+# Path to the file just downloaded
+# download_file
+
+# These are all values from the JSON API. For example, see:
+# https://api.adoptopenjdk.net/v2/info/releases/openjdk11?release=latest&openjdk_impl=hotspot&os=linux&arch=x64&heap_size=normal&type=jdk
+# release_name
+# metadata_json
+# binary_name
+# binary_link
+# openjdk_impl
+# checksum_link
+# version
+# semver
+
+# The SHA256 checksum found by resolving $checksum_link
+# checksum
+
+log() {
+  echo "$@" >&2
+}
+
+checksum() {
+  shasum -a256 "$1" | awk '{print $1}'
+}
+
+curl() {
+  command curl \
+    --silent \
+    --show-error \
+    --fail \
+    --location \
+    --retry 5 \
+    --retry-delay 5 \
+    --connect-timeout 5 \
+    "$@"
+}
+
+fetch_metadata() {
+  local product="${1:-openjdk8}"
+  local impl="${2:-hotspot}"
+  local api_url
+  local found
+  local json
+  api_url="https://api.adoptopenjdk.net/v2/info/releases/${product}?release=latest&openjdk_impl=${impl}&os=linux&arch=x64&heap_size=normal&type=jdk"
+  log "Fetching release information from ${api_url}"
+  json=$(curl "$api_url")
+  found=$(echo "$json" | jq --raw-output '.binaries | length | tostring')
+  if [ "$found" != 1 ]; then
+    log "Unexpected number of results. Expected 1, but found ${found}"
+    return 1
+  fi
+  release_name=$(echo "$json" | jq -r .release_name)
+  metadata_json=$(echo "$json" | jq .binaries[0])
+}
+
+parse_metadata() {
+  sh=$(echo "$metadata_json" | jq --raw-output '{
+      binary_name: .binary_name,
+      binary_link: .binary_link,
+      openjdk_impl: .openjdk_impl,
+      checksum_link: .checksum_link,
+      version: .version,
+      semver: .version_data.semver
+    } |
+    to_entries |
+    map(.key + "=" + (.value | @sh)) |
+    join("\n")
+  ')
+  eval "$sh"
+}
+
+fetch_checksum() {
+  log "Fetching checksum from ${checksum_link}"
+  checksum=$(curl "$checksum_link" | awk '{print $1}')
+  log "Checksum: ${checksum}"
+}
+
+download_file() {
+  local url="$1"
+  local file="$2"
+  local checksum_expected="$3"
+  local checksum_actual
+  if [ -r "$file" ]; then
+    checksum_actual=$(checksum "$file")
+    if [ "$checksum_expected" = "$checksum_actual" ]; then
+      log "File already downloaded"
+      return 0
+    else
+      log "Checksum mismatch: removing existing download"
+      log "Expected: $checksum_expected"
+      log "Actual: $checksum_actual"
+      rm -f "$file"
+    fi
+  fi
+
+  echo "Starting download"
+  echo "  from ${url}"
+  echo "  to   ${file}"
+  curl --output "$file" "$url"
+  checksum_actual=$(checksum "$file")
+  if [ "$checksum_actual" != "$checksum_expected" ]; then
+    log "Checksum mismatch file:${download_file} expected=${checksum}"
+    return 1
+  fi
+}
+
+download() {  
+  fetch_metadata "$@"
+  parse_metadata
+  fetch_checksum
+
+  download_file="${work_dir}/$binary_name"
+  download_file "$binary_link" "$download_file" "$checksum"
+}
+
+unpack() {
+  mkdir -p "${work_dir}/${openjdk_impl}"
+  tar zxf "$download_file" -C "${work_dir}/${openjdk_impl}"
+}
+
+provides() {
+  local v="$1"
+  local i
+  printf -- "--provides java-compiler"
+  for i in "" 2 $(seq 5 $v); do
+    printf " --provides java${i}-sdk --provides java${i}-runtime"
+    printf " --provides java${i}-sdk-headless --provides java${i}-runtime-headless"
+  done
+}
+
+depends() {
+  for lib in libasound2 libc6 libgcc1 libx11-6 libxau6 libxcb1 libxdmcp6 libxext6 libxi6 libxrender1 libxtst6 zlib1g; do
+    printf -- " --depends $lib"
+  done
+}
+
+build_deb() {
+  local name="openjdk-${version}-${openjdk_impl}"
+  local prefix=$(tar tf "$download_file" | awk -F / '{print $1; exit;}')
+  local from="${work_dir}/${openjdk_impl}/${prefix}"
+  local java_name="openjdk-${version}-${openjdk_impl}"
+  local java_home="/usr/lib/jvm/${java_name}"
+  local bin_ignore='.*(appletviewer|java-rmi.cgi|policytool)'
+  local depends="$(depends)"
+  local provides="$(provides "$version")"
+  local priority=1081
+  cat > .dotfile <<EOF
+name=${java_name}
+priority=${priority}
+section=main
+
+$(find "${from}/bin" \
+  -regextype posix-extended \
+  -regex "$bin_ignore" -prune -o \
+  -type f \
+  -printf "hl %f ${java_home}/bin/%f\n" | \
+  sort)
+EOF
+  fpm \
+    --name "$name" \
+    --version "$semver" \
+    --maintainer 'Martin Ellis <martin.ellis@gov.scot>' \
+    --vendor AdoptOpenJDK \
+    --url https://adoptopenjdk.net/ \
+    --architecture amd64 \
+    --no-deb-no-default-config-files \
+    --input-type dir \
+    --output-type deb \
+    --exclude '*/src.zip' \
+    --exclude '*/sample' \
+    --exclude '*/demo' \
+    --exclude '*/man/ja*' \
+    ${provides} \
+    ${depends} \
+    --after-install "${script_dir}/postinst" \
+    --before-remove "${script_dir}/prerm" \
+    --template-value "name=${name}" \
+    --template-value "java_home=${java_home}" \
+    --template-value "priority=${priority}" \
+    --template-value "bin_ignore=${bin_ignore}" \
+    "${from}/=${java_home}" \
+    ".dotfile=/usr/lib/jvm/.${java_name}.jinfo"
+}
+
+download "$@"
+unpack
+build_deb
